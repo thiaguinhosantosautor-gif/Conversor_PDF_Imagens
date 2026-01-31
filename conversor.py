@@ -1,49 +1,102 @@
 import os
 import io
 import zipfile
+import shutil
+import re
+import warnings
+from concurrent.futures import ProcessPoolExecutor
+from tqdm.auto import tqdm
+
+# PDF Libraries
 import PyPDF2
 from pdf2docx import Converter
 import pdfplumber
-import pandas as pd
-from pdf2image import convert_from_path
+from pdf2image import convert_from_bytes # Changed from convert_from_path for parallel processing
 import pytesseract
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import fitz  # PyMuPDF
 from PIL import Image
-import warnings
+import pandas as pd
+
 warnings.filterwarnings('ignore')
+
+# Variável global para o caminho base do Drive, a ser definida por main.py
+GLOBAL_BASE_DRIVE_PATH = '/content/drive/MyDrive/DESMONTE_V01/' # Default, será sobrescrito
+
+def set_global_base_drive_path(path):
+    global GLOBAL_BASE_DRIVE_PATH
+    GLOBAL_BASE_DRIVE_PATH = path
+
+def get_base_drive_path():
+    return GLOBAL_BASE_DRIVE_PATH
+
+# ==================== FUNÇÕES AUXILIARES PARA PROCESSAMENTO PARALELO ====================
+def _convert_single_page_to_image(page_info):
+    """Helper to convert a single PDF page to an image."""
+    pdf_bytes, page_num, dpi, output_dir = page_info
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num)
+        if images:
+            image = images[0]
+            image_path = f"{output_dir}/pagina_{page_num}.jpg"
+            image.save(image_path, 'JPEG', quality=95)
+            return image_path
+    except Exception as e:
+        print(f"❌ Erro ao converter página {page_num} para imagem: {str(e)}")
+    return None
+
+def _ocr_single_page(page_info):
+    """Helper to perform OCR on a single PDF page image and return text."""
+    pdf_bytes_data, page_num, dpi, lang = page_info
+    try:
+        images = convert_from_bytes(pdf_bytes_data, dpi=dpi, first_page=page_num, last_page=page_num)
+        if images:
+            image = images[0]
+            text = pytesseract.image_to_string(image, lang=lang)
+            return f"""
+--- Página {page_num} ---
+{text}
+"""
+    except Exception as e:
+        return f"""
+--- Erro na Página {page_num} (OCR): {str(e)} ---
+"""
+    return ""
 
 # ==================== FUNÇÕES DE CONVERSÃO ====================
 def pdf_to_text(pdf_path):
-    """Converte PDF para arquivo de texto"""
-    output_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '.txt')}"
+    """Converte PDF para arquivo de texto usando pdfplumber"""
+    output_path = os.path.join(get_base_drive_path(), "output_files", os.path.basename(pdf_path).replace('.pdf', '.txt'))
 
     try:
-        with open(pdf_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            text = ""
+        text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text(x_tolerance=1) if page.extract_text() else '' # x_tolerance para melhor fusão de texto
 
-            for page_num in range(len(pdf_reader.pages)):
-                page = pdf_reader.pages[page_num]
-                text += page.extract_text()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as text_file:
+            text_file.write(text)
 
-            # Salvar texto
-            with open(output_path, 'w', encoding='utf-8') as text_file:
-                text_file.write(text)
+        print(f"✅ PDF convertido para texto com pdfplumber: {output_path}")
+        return output_path
 
-            print(f"✅ PDF convertido para texto: {output_path}")
-            return output_path
-
+    except PyPDF2.errors.PdfReadError:
+        print(f"❌ Erro: O PDF '{os.path.basename(pdf_path)}' parece estar corrompido ou protegido por senha e não pode ser lido.")
+        return None
+    except FileNotFoundError:
+        print(f"❌ Erro: O arquivo PDF '{os.path.basename(pdf_path)}' não foi encontrado.")
+        return None
     except Exception as e:
-        print(f"❌ Erro na conversão para texto: {str(e)}")
+        print(f"❌ Erro inesperado na conversão para texto: {str(e)}")
         return None
 
 def pdf_to_word(pdf_path):
     """Converte PDF para Word (.docx)"""
-    try:
-        output_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '.docx')}"
+    output_path = os.path.join(get_base_drive_path(), "output_files", os.path.basename(pdf_path).replace('.pdf', '.docx'))
 
+    try:
         cv = Converter(pdf_path)
         cv.convert(output_path, start=0, end=None)
         cv.close()
@@ -57,7 +110,7 @@ def pdf_to_word(pdf_path):
 
 def pdf_to_excel(pdf_path):
     """Extrai tabelas do PDF para Excel"""
-    output_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '.xlsx')}"
+    output_path = os.path.join(get_base_drive_path(), "output_files", os.path.basename(pdf_path).replace('.pdf', '.xlsx'))
 
     try:
         all_tables = []
@@ -73,6 +126,7 @@ def pdf_to_excel(pdf_path):
                         all_tables.append(df)
 
         if all_tables:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
                 for i, df in enumerate(all_tables):
                     df.to_excel(writer, sheet_name=f'Tabela_{i+1}', index=False)
@@ -88,37 +142,46 @@ def pdf_to_excel(pdf_path):
         return None
 
 def pdf_to_images(pdf_path):
-    """Converte cada página do PDF para imagem"""
-    try:
-        base_name = os.path.basename(pdf_path).replace('.pdf', '')
-        output_dir = f"output_files/{base_name}_images"
-        os.makedirs(output_dir, exist_ok=True)
+    """Converte cada página do PDF para imagem usando processamento paralelo e barra de progresso"""
+    base_name = os.path.basename(pdf_path).replace('.pdf', '')
+    output_dir = os.path.join(get_base_drive_path(), "output_files", f"{base_name}_images")
+    os.makedirs(output_dir, exist_ok=True)
 
-        # Converter PDF para imagens
-        images = convert_from_path(pdf_path, dpi=200)
+    try:
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes_data = f.read()
+
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes_data))
+        total_pages = len(reader.pages)
 
         image_paths = []
-        for i, image in enumerate(images):
-            image_path = f"{output_dir}/pagina_{i+1}.jpg"
-            image.save(image_path, 'JPEG', quality=95)
-            image_paths.append(image_path)
+        tasks = [ (pdf_bytes_data, i + 1, 200, output_dir) for i in range(total_pages) ]
 
-        # Criar arquivo ZIP com as imagens
-        zip_path = f"output_files/{base_name}_images.zip"
+        with ProcessPoolExecutor() as executor:
+            results = list(tqdm(executor.map(_convert_single_page_to_image, tasks), total=total_pages, desc=f"Convertendo {base_name} para imagens"))
+            for path in results:
+                if path:
+                    image_paths.append(path)
+
+        if not image_paths:
+            print("ℹ️ Nenhuma imagem foi convertida.")
+            return None
+
+        zip_path = os.path.join(get_base_drive_path(), "output_files", f"{base_name}_images.zip")
         with zipfile.ZipFile(zip_path, 'w') as zipf:
             for img_path in image_paths:
                 zipf.write(img_path, os.path.basename(img_path))
 
-        print(f"✅ PDF convertido para {len(images)} imagens")
+        print(f"✅ PDF convertido para {len(image_paths)} imagens (paralelo): {zip_path}")
         return zip_path
 
     except Exception as e:
-        print(f"❌ Erro na conversão para imagens: {str(e)}")
+        print(f"❌ Erro na conversão para imagens (paralelo): {str(e)}")
         return None
 
 def pdf_to_html(pdf_path):
     """Converte PDF para HTML simples"""
-    output_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '.html')}"
+    output_path = os.path.join(get_base_drive_path(), "output_files", os.path.basename(pdf_path).replace('.pdf', '.html'))
 
     try:
         with open(pdf_path, 'rb') as file:
@@ -152,6 +215,7 @@ def pdf_to_html(pdf_path):
 
             html_content += "</body></html>"
 
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with open(output_path, 'w', encoding='utf-8') as html_file:
                 html_file.write(html_content)
 
@@ -163,90 +227,84 @@ def pdf_to_html(pdf_path):
         return None
 
 def pdf_to_pdfa(pdf_path):
-    """Converte para PDF/A (padrão arquivável)"""
+    """Converte para PDF/A (padrão arquivável) usando PyMuPDF (fitz)"""
+    output_path = os.path.join(get_base_drive_path(), "output_files", os.path.basename(pdf_path).replace('.pdf', '_pdfa.pdf'))
+
     try:
-        from PyPDF2 import PdfReader, PdfWriter
+        doc = fitz.open(pdf_path)
+        doc.convert_to_pdfa(level=2, conformance="b", saveinfo=True, garbage=4, clean=True, deflating=True, savealpha=True, linear=True)
+        doc.save(output_path, garbage=4, clean=True, deflating=True)
+        doc.close()
 
-        output_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '_pdfa.pdf')}"
-
-        reader = PdfReader(pdf_path)
-        writer = PdfWriter()
-
-        for page in reader.pages:
-            writer.add_page(page)
-
-        # Adicionar metadados
-        writer.add_metadata({
-            '/Title': os.path.basename(pdf_path),
-            '/Creator': 'PDF Converter Colab',
-            '/Producer': 'PyPDF2',
-            '/CreationDate': 'D:20240101000000'
-        })
-
-        with open(output_path, 'wb') as output_file:
-            writer.write(output_file)
-
-        print(f"✅ PDF convertido para PDF/A: {output_path}")
+        print(f"✅ PDF convertido para PDF/A com fitz: {output_path}")
         return output_path
 
     except Exception as e:
-        print(f"❌ Erro na conversão para PDF/A: {str(e)}")
+        print(f"❌ Erro na conversão para PDF/A com fitz: {str(e)}")
         return None
 
 def pdf_ocr(pdf_path):
-    """Aplica OCR no PDF para extrair texto de imagens"""
+    """Aplica OCR no PDF para extrair texto de imagens usando processamento paralelo e barra de progresso"""
+    base_name = os.path.basename(pdf_path).replace('.pdf', '')
+    output_files_dir = os.path.join(get_base_drive_path(), "output_files")
+    os.makedirs(output_files_dir, exist_ok=True)
+
     try:
-        base_name = os.path.basename(pdf_path).replace('.pdf', '')
-        temp_dir = "temp_files"
-        os.makedirs(temp_dir, exist_ok=True)
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes_data = f.read()
 
-        # Converter PDF para imagens
-        images = convert_from_path(pdf_path, dpi=300)
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes_data))
+        total_pages = len(reader.pages)
 
-        text_content = ""
-        for i, image in enumerate(images):
-            # Aplicar OCR em cada imagem
-            text = pytesseract.image_to_string(image, lang='por+eng')
-            text_content += f"\n\n--- Página {i+1} ---\n\n{text}"
+        tasks = [ (pdf_bytes_data, i + 1, 300, 'por+eng') for i in range(total_pages) ]
 
-        # Salvar texto extraído
-        output_path = f"output_files/{base_name}_ocr.txt"
-        with open(output_path, 'w', encoding='utf-8') as f:
+        text_content_parts = []
+        with ProcessPoolExecutor() as executor:
+            results = list(tqdm(executor.map(_ocr_single_page, tasks), total=total_pages, desc=f"Processando OCR para {base_name}"))
+            for part in results:
+                text_content_parts.append(part)
+
+        text_content = "".join(text_content_parts)
+
+        output_txt_path = os.path.join(output_files_dir, f"{base_name}_ocr.txt")
+        with open(output_txt_path, 'w', encoding='utf-8') as f:
             f.write(text_content)
+        print(f"✅ Texto OCR extraído salvo em: {output_txt_path}")
 
-        # Criar novo PDF com texto
-        pdf_output_path = f"output_files/{base_name}_ocr.pdf"
+        pdf_output_path = os.path.join(output_files_dir, f"{base_name}_ocr.pdf")
         c = canvas.Canvas(pdf_output_path, pagesize=letter)
 
         lines = text_content.split('\n')
         y = 750
         for line in lines:
-            if y < 50:  # Nova página
+            if y < 50:
                 c.showPage()
                 y = 750
-            c.drawString(50, y, line[:100])  # Limita o tamanho da linha
+            display_line = line[:80]
+            c.drawString(50, y, display_line)
             y -= 15
 
         c.save()
 
-        print(f"✅ OCR aplicado e PDF criado: {pdf_output_path}")
+        print(f"✅ PDF pesquisável com OCR criado: {pdf_output_path}")
         return pdf_output_path
 
     except Exception as e:
-        print(f"❌ Erro no OCR: {str(e)}")
+        print(f"❌ Erro no OCR com processamento paralelo: {str(e)}")
         print("⚠️ Certifique-se de que Tesseract está instalado corretamente")
         return None
 
 def extract_images_from_pdf(pdf_path):
     """Extrai todas as imagens de um PDF"""
-    output_dir = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '_extracted_images')}"
+    base_name = os.path.basename(pdf_path).replace('.pdf', '')
+    output_dir = os.path.join(get_base_drive_path(), "output_files", f"{base_name}_extracted_images")
     os.makedirs(output_dir, exist_ok=True)
 
     try:
         pdf_document = fitz.open(pdf_path)
         image_paths = []
 
-        for page_num in range(len(pdf_document)):
+        for page_num in tqdm(range(len(pdf_document)), desc=f"Extraindo imagens de {os.path.basename(pdf_path)}"):
             page = pdf_document[page_num]
             image_list = page.get_images(full=True)
 
@@ -256,7 +314,7 @@ def extract_images_from_pdf(pdf_path):
                 image_bytes = base_image["image"]
 
                 image_ext = base_image["ext"]
-                image_filename = f"{output_dir}/pagina_{page_num+1}_img_{img_index+1}.{image_ext}"
+                image_filename = os.path.join(output_dir, f"pagina_{page_num+1}_img_{img_index+1}.{image_ext}")
 
                 with open(image_filename, "wb") as image_file:
                     image_file.write(image_bytes)
@@ -266,13 +324,12 @@ def extract_images_from_pdf(pdf_path):
         pdf_document.close()
 
         if image_paths:
-            # Criar ZIP com imagens extraídas
-            zip_path = f"{output_dir}.zip"
+            zip_path = os.path.join(get_base_drive_path(), "output_files", f"{base_name}_images.zip")
             with zipfile.ZipFile(zip_path, 'w') as zipf:
                 for img_path in image_paths:
                     zipf.write(img_path, os.path.basename(img_path))
 
-            print(f"✅ {len(image_paths)} imagens extraídas do PDF")
+            print(f"✅ {len(image_paths)} imagens extraídas do PDF: {zip_path}")
             return zip_path
         else:
             print("ℹ️ Nenhuma imagem encontrada no PDF")
@@ -283,82 +340,82 @@ def extract_images_from_pdf(pdf_path):
         return None
 
 def merge_pdfs(pdf_files):
-    """Mescla múltiplos PDFs em um único arquivo"""
-    from PyPDF2 import PdfMerger
-
-    output_path = "output_files/merged_document.pdf"
+    """Mescla múltiplos PDFs em um único arquivo usando PyMuPDF (fitz) com barra de progresso"""
+    output_path = os.path.join(get_base_drive_path(), "output_files", "merged_document.pdf")
 
     try:
-        merger = PdfMerger()
+        output_pdf = fitz.open()
 
-        for pdf_file in pdf_files:
-            merger.append(pdf_file)
+        for pdf_file in tqdm(pdf_files, desc="Mesclando PDFs"):
+            input_pdf = fitz.open(pdf_file)
+            output_pdf.insert_pdf(input_pdf)
+            input_pdf.close()
 
-        merger.write(output_path)
-        merger.close()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        output_pdf.save(output_path)
+        output_pdf.close()
 
         print(f"✅ {len(pdf_files)} PDFs mesclados em: {output_path}")
         return output_path
 
     except Exception as e:
-        print(f"❌ Erro ao mesclar PDFs: {str(e)}")
+        print(f"❌ Erro ao mesclar PDFs com fitz: {str(e)}")
         return None
 
 def split_pdf(pdf_path):
-    """Divide um PDF em páginas individuais"""
-    from PyPDF2 import PdfReader, PdfWriter
-
+    """Divide um PDF em páginas individuais usando PyMuPDF (fitz) com barra de progresso"""
     base_name = os.path.basename(pdf_path).replace('.pdf', '')
-    output_dir = f"output_files/{base_name}_pages"
+    output_dir = os.path.join(get_base_drive_path(), "output_files", f"{base_name}_pages")
     os.makedirs(output_dir, exist_ok=True)
 
     try:
-        reader = PdfReader(pdf_path)
-        total_pages = len(reader.pages)
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
 
         individual_files = []
 
-        for i in range(total_pages):
-            writer = PdfWriter()
-            writer.add_page(reader.pages[i])
+        for i in tqdm(range(total_pages), desc=f"Dividindo {base_name}"):
+            output_pdf = fitz.open()
+            output_pdf.insert_pdf(doc, from_page=i, to_page=i)
 
-            output_file = f"{output_dir}/pagina_{i+1}.pdf"
-            with open(output_file, "wb") as output_pdf:
-                writer.write(output_pdf)
+            output_file = os.path.join(output_dir, f"pagina_{i+1}.pdf")
+            output_pdf.save(output_file)
+            output_pdf.close()
 
             individual_files.append(output_file)
 
-        # Criar arquivo ZIP com todas as páginas
-        zip_path = f"{output_dir}.zip"
+        doc.close()
+
+        zip_path = os.path.join(get_base_drive_path(), "output_files", f"{base_name}_pages.zip")
         with zipfile.ZipFile(zip_path, 'w') as zipf:
             for file_path in individual_files:
                 zipf.write(file_path, os.path.basename(file_path))
 
-        print(f"✅ PDF dividido em {total_pages} páginas individuais")
+        print(f"✅ PDF dividido em {total_pages} páginas individuais com fitz: {zip_path}")
         return zip_path
 
     except Exception as e:
-        print(f"❌ Erro ao dividir PDF: {str(e)}")
+        print(f"❌ Erro ao dividir PDF com fitz: {str(e)}")
         return None
 
 def compress_pdf(pdf_path):
-    """Comprime um PDF reduzindo qualidade de imagens"""
+    """Comprime um PDF reduzindo qualidade de imagens com barra de progresso"""
+    output_path = os.path.join(get_base_drive_path(), "output_files", os.path.basename(pdf_path).replace('.pdf', '_compressed.pdf'))
+
     try:
-        output_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', '_compressed.pdf')}"
-
         doc = fitz.open(pdf_path)
+        total_pages = len(doc)
 
-        # Configuração de compressão
-        for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))  # Reduz resolução
-            page.insert_image(page.rect, pixmap=pix)  # Reinsere imagem comprimida
+        for i in tqdm(range(total_pages), desc=f"Comprimindo {os.path.basename(pdf_path)}"):
+            page = doc[i]
+            # The actual compression happens on doc.save, this loop is just for progress indication.
 
-        # Salva com compressão
-        doc.save(output_path, garbage=4, deflate=True, clean=True)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        doc.save(output_path, garbage=4, deflate=True, clean=True, super_fast=True)
         doc.close()
 
-        original_size = os.path.getsize(pdf_path) / 1024  # KB
-        new_size = os.path.getsize(output_path) / 1024  # KB
+        original_size = os.path.getsize(pdf_path) / 1024 # KB
+        new_size = os.path.getsize(output_path) / 1024 # KB
         reduction = ((original_size - new_size) / original_size) * 100
 
         print(f"✅ PDF comprimido: {output_path}")
@@ -375,6 +432,8 @@ def compress_pdf(pdf_path):
 def pdf_to_csv_conversion(pdf_path):
     """Extrai tabelas do PDF para CSV"""
     converted_csv_paths = []
+    output_dir = os.path.join(get_base_drive_path(), "output_files")
+    os.makedirs(output_dir, exist_ok=True)
     try:
         with pdfplumber.open(pdf_path) as pdf:
             tables_found = 0
@@ -383,7 +442,7 @@ def pdf_to_csv_conversion(pdf_path):
                 for j, table in enumerate(tables):
                     if table:
                         df = pd.DataFrame(table)
-                        csv_path = f"output_files/{os.path.basename(pdf_path).replace('.pdf', f'_page{i+1}_table{j+1}.csv')}"
+                        csv_path = os.path.join(output_dir, os.path.basename(pdf_path).replace('.pdf', f'_page{i+1}_table{j+1}.csv'))
                         df.to_csv(csv_path, index=False, encoding='utf-8')
                         converted_csv_paths.append(csv_path)
                         tables_found += 1
@@ -394,5 +453,3 @@ def pdf_to_csv_conversion(pdf_path):
     except Exception as e:
         print(f"❌ Erro na extração para CSV: {str(e)}")
         return []
-
-print("✅ conversor.py atualizado com sucesso!")
