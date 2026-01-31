@@ -15,7 +15,7 @@ Este projeto é um conversor de arquivos PDF versátil e modularizado. Ele permi
 - **PDF para CSV**: Extrai tabelas de PDFs para arquivos CSV.
 - **Mesclar Múltiplos PDFs**: Combina vários PDFs em um único documento.
 - **Dividir PDF por Páginas**: Separa um PDF em arquivos individuais por página.
-- **Comprimir PDF**: Reduz o tamanho do arquivo PDF.
+- **Comprimir PDF**: Reduz o tamanho do arquivo do PDF.
 - **Converter Todas as Opções**: Realiza múltiplas conversões simultaneamente.
 
 ## Estrutura do Projeto
@@ -72,7 +72,7 @@ O conversor pode ser usado de três maneiras: **interativa** (via menu no termin
 
 ### Modo Linha de Comando (CLI)
 
-Você pode executar conversões diretamente do terminal, fornecendo os arquivos de entrada e a opção de conversão como argumentos. Use `-h` ou `--help` para ver todas as opções:
+You pode executar conversões diretamente do terminal, fornecendo os arquivos de entrada e a opção de conversão como argumentos. Use `-h` ou `--help` para ver todas as opções:
 
 ```bash
 python main.py --help
@@ -118,6 +118,45 @@ Para usar a interface web, você precisa iniciar o servidor Flask:
     -   **Faça o Upload do PDF**: Arraste e solte seu arquivo PDF na área de upload ou clique nela para abrir o seletor de arquivos. (Para a opção "Mesclar PDFs", selecione múltiplos arquivos.)
     -   **Inicie a Conversão**: Clique no botão "PROCESSAR".
     -   **Baixe o Resultado**: Após a conclusão, um botão "BAIXAR" aparecerá para você fazer o download do arquivo ZIP contendo os resultados da conversão.
+
+## Para Usuários Windows: Experiência de 'Clicar no Ícone'
+
+Para uma experiência mais amigável no Windows, você pode:
+
+### 1. Criar um Executável (para a versão CLI)
+
+Você pode usar o `PyInstaller` para empacotar a versão CLI do seu conversor em um único arquivo `.exe`, eliminando a necessidade de instalar Python no ambiente de uso.
+
+1.  **Instale PyInstaller** (se ainda não o fez):
+
+    ```bash
+    pip install pyinstaller
+    ```
+
+2.  **Gere o executável**:
+
+    Navegue até o diretório raiz do projeto (`<nome_do_repositorio>`) no terminal e execute:
+
+    ```bash
+    pyinstaller --onefile main.py
+    ```
+    Isso criará uma pasta `dist` no diretório do seu projeto. Dentro dela, você encontrará `main.exe`.
+
+3.  **Crie um Atalho no Desktop para a Versão CLI**:
+    -   Localize o arquivo `main.exe` na pasta `dist`.
+    -   Clique com o botão direito nele e selecione "Enviar para" > "Área de trabalho (criar atalho)".
+    -   Você pode renomear o atalho (ex: "Conversor PDF CLI").
+    -   Para usar, arraste e solte um arquivo PDF sobre o atalho ou execute-o e use-o via linha de comando no `cmd` que será aberto.
+
+### 2. Iniciar a Aplicação Web com um Script (.bat)
+
+O arquivo `start_web_converter.bat` já está configurado para iniciar o servidor Flask e abrir o navegador automaticamente. Para usá-lo facilmente:
+
+1.  **Crie um Atalho no Desktop para a Versão Web**:
+    -   Localize o arquivo `start_web_converter.bat` no diretório raiz do projeto.
+    -   Clique com o botão direito nele e selecione "Enviar para" > "Área de trabalho (criar atalho)".
+    -   Você pode renomear o atalho (ex: "Conversor PDF Web").
+    -   Ao clicar duas vezes neste atalho, o servidor web será iniciado em segundo plano e a interface web será aberta no seu navegador padrão.
 
 ## Compatibilidade com Google Colab
 
